@@ -14,7 +14,9 @@ def detect_and_plot(g: ig.Graph,
                             vertex_size: int = 80,
                             arrangement: str = "circle",   # "circle" or "grid"
                             group_spacing: float = 4.0,    # distance between group centers
-                            draw_group_circles: bool = True):
+                            draw_group_circles: bool = True,
+                            plot :bool =True,
+                            seed: int = 42):
     """
     Detect communities with Leiden, compute sublayouts and place each community in its own region,
     then plot with matplotlib.
@@ -38,7 +40,7 @@ def detect_and_plot(g: ig.Graph,
         weights = None
 
     partition = leidenalg.find_partition(g, leidenalg.RBConfigurationVertexPartition,
-                                         weights=weights, resolution_parameter=resolution)
+                                         weights=weights, resolution_parameter=resolution, seed=seed)
     membership = partition.membership
     ncomms = len(set(membership))
     print(f"Found {ncomms} communities.")
@@ -48,6 +50,9 @@ def detect_and_plot(g: ig.Graph,
     for v_idx, c in enumerate(membership):
         comm_nodes.setdefault(c, []).append(v_idx)
     comm_nodes = {c: comm_nodes[c] for c in sorted(comm_nodes.keys())}
+
+    if not plot:
+        return partition
 
     # 3) For each community compute an internal layout (coords relative to (0,0))
     comm_coords = {}

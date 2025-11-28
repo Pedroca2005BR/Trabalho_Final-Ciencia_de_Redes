@@ -1,222 +1,511 @@
-import networkx as nx
-import leidenalg
+import json
+import pandas as pd
 import igraph as ig
-from collections import defaultdict
-from itertools import combinations
-import numpy as np
+# from detect_and_plot_leiden import detect_and_plot
 
-# ============================== Função para Construir Grafo ==============================
-def construir_grafo(conexoes):
-    """
-    Cria um grafo NetworkX a partir de um dicionário de conexões entre áreas.
+def prepare_data(country_code: str) -> ig.Graph:
+    """Possible country codes: RO, HR, HU"""
+    directory = "deezer_clean_data/"
+    edges_file = f"{country_code}_edges.csv"
+    genres_file = f"{country_code}_genres.json"
 
-    Parâmetros:
-        conexoes (dict): Chaves são tuplas de áreas (nós), e valores são os pesos (quantidade de conexões).
+    try:
+        # --- 1. Ler o CSV de arestas ---
+        # O arquivo contém pares de IDs (u, v) representando amizades mútuas
+        edges_df = pd.read_csv(directory + edges_file, header=None, skiprows=1)
+    except FileNotFoundError:
+        print(f"Arquivo {edges_file} não encontrado no diretório {directory}.")
+        return None
+    
+    # Converter DataFrame para lista de tuplas (u, v)
+    edges = list(zip(edges_df[0], edges_df[1]))
 
-    Retorno:
-        G (Graph): Grafo NetworkX com os nós e arestas ponderadas.
-    """
-    G = nx.Graph()
-    areas = set([a for pair in conexoes for a in pair])  # Lista única de áreas envolvidas nas conexões
-    G.add_nodes_from(areas)  # Adiciona os nós
+    # --- 2. Criar grafo não-direcionado ---
+    G = ig.Graph(edges=edges, directed=False)
 
-    # Adiciona as arestas com pesos
-    for (a1, a2), peso in conexoes.items():
-        G.add_edge(a1, a2, weight=peso)
+    print(f"Grafo criado com {G.vcount()} nós e {G.ecount()} arestas")
+
+    # --- 3. Ler o JSON com preferências musicais ---
+    with open(directory + genres_file, "r") as f:
+        genres_data = json.load(f)
+
+    # --- 4. Adicionar atributo 'genres' a cada nó ---
+    # Os nós foram indexados de 0 em diante, então o índice do JSON = ID do nó
+    genres_attr = [None] * G.vcount()  # inicializa lista de atributos
+
+    for node_id, liked_genres in genres_data.items():
+        node_id = int(node_id)
+        if node_id < G.vcount():  # evita erro se houver IDs fora do range
+            genres_attr[node_id] = liked_genres
+
+    # adiciona o atributo ao grafo
+    G.vs["genres"] = genres_attr
 
     return G
 
-# ============================== Grafos por Ano ==============================
-def construir_grafos_por_ano(conexoes_por_ano):
+def print_graph_info(g: ig.Graph):
+    print(f"Grafo tem {g.vcount()} nós e {g.ecount()} arestas.")
+    if "genres" in g.vs.attributes():
+        sample_node = g.vs[0]
+        print(f"Nó de exemplo (ID {sample_node.index}) tem gêneros: {sample_node['genres']}")
+    else:
+        print("Atributo 'genres' não encontrado nos nós do grafo.")
+
+def get_genre_distribution(g: ig.Graph, percentage: bool = False) -> dict:
+    """Retorna a distribuição de gêneros no grafo.
+    
+    Parameters
+    ----------
+    g : ig.Graph
+        O grafo com atributo 'genres' nos nós.
+    percentage : bool, optional
+        Se True, retorna a porcentagem de ouvintes por gênero.
+        Se False (padrão), retorna a contagem absoluta.
+    
+    Returns
+    -------
+    dict
+        Dicionário com gêneros como chaves e contagem (ou porcentagem) como valores,
+        ordenado em ordem decrescente.
     """
-    Cria um grafo separado para cada ano.
+    genre_count = {}
+    for genres in g.vs["genres"]:
+        if genres:
+            for genre in genres:
+                genre_count[genre] = genre_count.get(genre, 0) + 1
+    
+    # Calcula porcentagem se solicitado
+    if percentage:
+        total = g.vcount()
+        if total > 0:
+            genre_count = {g: round((count / total) * 100, 2) for g, count in genre_count.items()}
+    
+    # Ordena por quantidade de ouvintes em ordem decrescente
+    return dict(sorted(genre_count.items(), key=lambda x: x[1], reverse=True))
 
-    Parâmetros:
-        conexoes_por_ano (dict): Dicionário com ano como chave e conexões como valor.
+def get_top_songs_by_community(partitions, graph: ig.Graph = None, song_attr: str = 'tracks', top_n: int = 5) -> dict:
+    """Agrupa nós por comunidade (a partir de `partitions`) e retorna os top N itens
 
-    Retorno:
-        grafos (dict): Dicionário com ano como chave e grafo NetworkX como valor.
+    Parameters
+    ----------
+    partitions : VertexClustering ou lista
+        Objeto retornado por `leidenalg.find_partition` (ou lista de rótulos de comunidade).
+    graph : ig.Graph, optional
+        O grafo onde os atributos dos nós residem. Se None, tenta obter de
+        `partitions.graph` (quando aplicável). Se não disponível, lança erro.
+    song_attr : str
+        Nome do atributo de vértice que contém as músicas (pode ser lista, tupla, set
+        ou dict mapping song->count). Valor padrão: `'tracks'`.
+    top_n : int
+        Quantos itens retornar por comunidade.
+
+    Returns
+    -------
+    dict
+        Dicionário {community_id: [(item, count), ...]} ordenado por frequência decrescente.
+
+    Observações
+    ----------
+    - Se o atributo `song_attr` não existir, a função tenta usar `'genres'` como
+      fallback e retorna os gêneros mais comuns por comunidade.
     """
-    grafos = {}
-    for ano, conexoes in conexoes_por_ano.items():
-        grafos[ano] = construir_grafo(conexoes)
-    return grafos
+    from collections import Counter
 
-def gerar_pares_por_ano(df):
+    # extrai membership
+    if hasattr(partitions, 'membership'):
+        membership = list(partitions.membership)
+        if graph is None and hasattr(partitions, 'graph'):
+            try:
+                graph = partitions.graph
+            except Exception:
+                graph = None
+    elif isinstance(partitions, (list, tuple)):
+        membership = list(partitions)
+    else:
+        raise TypeError("'partitions' deve ser um objeto VertexClustering ou uma lista de rótulos de comunidade")
+
+    if graph is None:
+        raise ValueError("Parâmetro 'graph' não fornecido e não encontrado em 'partitions'. Passe o grafo como argumento.")
+
+    attr_names = graph.vs.attribute_names()
+    # fallback para 'genres' se não existir o atributo de músicas
+    if song_attr not in attr_names:
+        if 'genres' in attr_names:
+            # computa top gêneros por comunidade
+            comms = {}
+            for v_idx, c in enumerate(membership):
+                comms.setdefault(c, []).append(v_idx)
+            result = {}
+            for c, nodes in comms.items():
+                ctr = Counter()
+                for v in nodes:
+                    genres = graph.vs[v]['genres']
+                    if not genres:
+                        continue
+                    for g in genres:
+                        ctr[g] += 1
+                result[c] = ctr.most_common(top_n)
+            return result
+        raise ValueError(f"Atributo de nó '{song_attr}' não encontrado. Atributos disponíveis: {attr_names}")
+
+    # agrupa nós por comunidade
+    comms = {}
+    for v_idx, c in enumerate(membership):
+        comms.setdefault(c, []).append(v_idx)
+
+    result = {}
+    for c, nodes in comms.items():
+        ctr = Counter()
+        for v in nodes:
+            val = graph.vs[v].get(song_attr)
+            if val is None:
+                continue
+            # se for dict: key -> count
+            if isinstance(val, dict):
+                for k, cnt in val.items():
+                    try:
+                        ctr[k] += int(cnt)
+                    except Exception:
+                        ctr[k] += 1
+            # se for lista/tupla/set: cada entrada conta 1
+            elif isinstance(val, (list, tuple, set)):
+                for item in val:
+                    ctr[item] += 1
+            else:
+                # valor escalar (ex: string)
+                ctr[val] += 1
+        result[c] = ctr.most_common(top_n)
+
+    return result
+
+
+def is_scale_free(g: ig.Graph, method: str = 'regression', kmin: int | None = None,
+                  gamma_range: tuple = (2.0, 3.0), r2_threshold: float = 0.8,
+                  min_points: int = 3, return_details: bool = False) -> bool:
+    """Testa se um grafo é compatível com uma distribuição livre de escala.
+
+    Implementação leve baseada em regressão linear no espaço log-log da
+    distribuição de grau (P(k) vs k). Não requer dependências externas
+    (como `powerlaw`) e fornece uma heurística útil para análise exploratória.
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo a ser testado.
+    method : str
+        Atualmente apenas 'regression' é suportado (regressão log-log).
+    kmin : int | None
+        Grau mínimo a considerar na cauda (se None, usa 1).
+    gamma_range : tuple
+        Intervalo aceitável para o expoente $
+        \gamma$ (por exemplo (2.0, 3.0)).
+    r2_threshold : float
+        Valor mínimo de R^2 da regressão para aceitar a hipótese de lei de potência.
+    min_points : int
+        Número mínimo de pontos únicos (k) na cauda para executar a regressão.
+    return_details : bool
+        Se True, retorna um dicionário com detalhes em vez de apenas bool.
+
+    Returns
+    -------
+    bool ou dict
+        Se `return_details` for False, retorna True/False indicando se o grafo passa
+        no teste heurístico. Se True, retorna dicionário com 'is_scale_free',
+        'gamma', 'r2', 'n_points', 'slope', 'intercept' e arrays usados.
     """
-    Gera os pares de áreas conectadas por crime para cada ano.
+    if method != 'regression':
+        raise ValueError("Apenas método 'regression' está implementado nesta função.")
 
-    Parâmetros:
-        df (DataFrame): Dados processados de ocorrências.
+    import numpy as np
+    from collections import Counter
 
-    Retorno:
-        grafos_por_ano (dict): Um grafo NetworkX para cada ano.
-        contagem_por_ano (dict): Contagem de registros por área, por ano e total.
+    degs = np.array(g.degree())
+    if kmin is None:
+        kmin = 1
+
+    # conta frequência de graus >= kmin
+    degs_tail = degs[degs >= kmin]
+    if degs_tail.size == 0:
+        result = {'is_scale_free': False, 'reason': 'no_degrees_ge_kmin'}
+        return result if return_details else False
+
+    cnt = Counter(degs_tail)
+    ks = np.array(sorted([k for k in cnt.keys() if k > 0]))
+    freqs = np.array([cnt[k] for k in ks], dtype=float)
+    # probabilidades P(k)
+    pk = freqs / freqs.sum()
+
+    n_points = ks.size
+    if n_points < min_points:
+        result = {'is_scale_free': False, 'reason': 'too_few_points', 'n_points': n_points}
+        return result if return_details else False
+
+    # regressão linear em log-log
+    logk = np.log(ks)
+    logpk = np.log(pk)
+
+    slope, intercept = np.polyfit(logk, logpk, 1)
+    pred = slope * logk + intercept
+    ss_res = np.sum((logpk - pred) ** 2)
+    ss_tot = np.sum((logpk - logpk.mean()) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    gamma = -slope  # P(k) ~ k^{-gamma} => slope ~= -gamma
+
+    is_sf = (gamma_range[0] <= gamma <= gamma_range[1]) and (r2 >= r2_threshold)
+
+    details = {
+        'is_scale_free': bool(is_sf),
+        'gamma': float(gamma),
+        'r2': float(r2),
+        'n_points': int(n_points),
+        'slope': float(slope),
+        'intercept': float(intercept),
+        'ks': ks,
+        'pk': pk
+    }
+
+    return details if return_details else bool(is_sf)
+
+
+def is_small_world(g: ig.Graph) -> float:
+    """Verifica se o grafo é um "small world" baseado na razão entre
+    o comprimento médio do caminho e o logaritmo do número de nós.
+
+    Parameters
+    ----------
+    g : ig.Graph
+        O grafo a ser testado.
+    threshold : float
+        Valor máximo aceitável para a razão (média do caminho / log(N)).
+
+    Returns
+    -------
+    bool
+        True se o grafo for considerado "small world", False caso contrário.
     """
-    df["ANO"] = df["DATE OCC"].dt.year  # Cria uma nova coluna com o ano da ocorrência
-    conexoes_por_ano = {}
-    contagem_por_ano = {}
-    contagem_por_ano["total"] = defaultdict(int)  # Contador total acumulado
+    import numpy as np
 
-    # Agrupa o DataFrame por ano
-    for ano, df_ano in df.groupby("ANO"):
-        grupos = df_ano.groupby(["Mocodes", "Crm Cd Desc"])  # Agrupa por tipo de crime
-        conexoes = defaultdict(int)
-        contagem_por_ano[ano] = defaultdict(int)
+    if g.vcount() < 2:
+        return False  # grafos muito pequenos não são considerados
 
-        # Para cada grupo de crime
-        for _, grupo in grupos:
-            areas = grupo["AREA NAME"]
-            
-            # Conta quantas vezes cada área aparece no grupo
-            for area in areas:
-                contagem_por_ano[ano][area] += 1
-                contagem_por_ano["total"][area] += 1
+    try:
+        avg_path_length = g.average_path_length()
+    except Exception:
+        return False  # se não for conexo ou erro, retorna False
 
-            # Gera todas as combinações possíveis de áreas para formar as conexões
-            for a1, a2 in combinations(sorted(areas), 2):
-                conexoes[(a1, a2)] += 1
+    n = g.vcount()
+    ratio = avg_path_length / np.log(n)
 
-        conexoes_por_ano[ano] = conexoes
+    return ratio
 
-    return construir_grafos_por_ano(conexoes_por_ano), contagem_por_ano
 
-# ============================== Grafo Total ==============================
-def gerar_pares_total(df):
+def musical_influence_analysis(g: ig.Graph, centrality_measure: str = 'degree',
+                               percentile_low: int = 25, percentile_high: int = 75,
+                               return_details: bool = False) -> dict:
+    """Analisa se nós mais centrais tendem a ouvir gêneros diferentes de nós menos centrais.
+
+    A hipótese de "influência musical" é verificada através da comparação entre
+    a diversidade/popularidade dos gêneros ouvidos pelos nós mais centrais
+    versus os menos centrais.
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo com atributo 'genres' nos nós.
+    centrality_measure : str
+        Medida de centralidade: 'degree', 'betweenness', 'closeness', 'eigenvector'.
+    percentile_low : int
+        Percentil inferior para definir nós "menos centrais" (ex: 25).
+    percentile_high : int
+        Percentil superior para definir nós "mais centrais" (ex: 75).
+    return_details : bool
+        Se True, retorna dicionário com análises detalhadas; se False, retorna
+        apenas um float com a razão de diferença de diversidade.
+
+    Returns
+    -------
+    dict ou float
+        Se `return_details` for False, retorna um float na faixa [0, 1] indicando
+        a diferença normalizada entre diversidade de gêneros (nós centrais vs nós periféricos).
+        Se True, retorna dicionário com 'diversity_central', 'diversity_peripheral',
+        'ratio', 'n_central', 'n_peripheral', 'centrality_values'.
     """
-    Cria o grafo total considerando todos os anos juntos.
+    import numpy as np
+    from collections import Counter
 
-    Parâmetros:
-        df (DataFrame): Dados processados.
+    # calcula centralidade
+    if centrality_measure == 'degree':
+        centrality = np.array(g.degree())
+    elif centrality_measure == 'betweenness':
+        centrality = np.array(g.betweenness())
+    elif centrality_measure == 'closeness':
+        centrality = np.array(g.closeness())
+    elif centrality_measure == 'eigenvector':
+        try:
+            centrality = np.array(g.eigenvector_centrality())
+        except Exception:
+            # se não convergir, usa grau como fallback
+            centrality = np.array(g.degree())
+    else:
+        raise ValueError(f"Medida de centralidade '{centrality_measure}' não suportada.")
 
-    Retorno:
-        grafo_total (Graph): Grafo NetworkX único para o dataset completo.
+    # define limites de percentis
+    low_threshold = np.percentile(centrality, percentile_low)
+    high_threshold = np.percentile(centrality, percentile_high)
+
+    # indices de nós em cada grupo
+    idx_peripheral = np.where(centrality <= low_threshold)[0]
+    idx_central = np.where(centrality >= high_threshold)[0]
+
+    # calcula diversidade: usa Shanon entropy ou número único de gêneros por grupo
+    def calc_diversity(indices):
+        genres_list = []
+        for i in indices:
+            genres = g.vs[i]['genres']
+            if genres:
+                genres_list.extend(genres)
+        if not genres_list:
+            return 0.0, 0
+        cnt = Counter(genres_list)
+        n_unique = len(cnt)
+        # Shannon entropy: H = -sum(p_i * log(p_i))
+        total = sum(cnt.values())
+        h = 0.0
+        for count in cnt.values():
+            p = count / total
+            if p > 0:
+                h -= p * np.log(p)
+        return h, n_unique
+
+    entropy_central, n_unique_central = calc_diversity(idx_central)
+    entropy_periph, n_unique_periph = calc_diversity(idx_peripheral)
+
+    # razão de diversidade
+    if entropy_periph > 0:
+        ratio = entropy_central / entropy_periph
+    else:
+        ratio = 1.0 if entropy_central == 0 else float('inf')
+
+    details = {
+        'entropy_central': float(entropy_central),
+        'entropy_peripheral': float(entropy_periph),
+        'n_unique_genres_central': int(n_unique_central),
+        'n_unique_genres_peripheral': int(n_unique_periph),
+        'ratio_entropy': float(ratio),
+        'n_central_nodes': int(len(idx_central)),
+        'n_peripheral_nodes': int(len(idx_peripheral)),
+        'centrality_measure': centrality_measure,
+        'centrality_values': centrality
+    }
+
+    return details if return_details else float(ratio)
+
+
+def check_neighbor_similarity(g: ig.Graph, percentile_low: int = 25,
+                              similarity_metric: str = 'jaccard',
+                              return_details: bool = False) -> dict:
+    """Verifica se nós menos centrais (periféricos) ouvem gêneros similares aos
+    seus vizinhos mais centrais.
+
+    A hipótese é: nós periféricos tendem a adotar gostos musicais similares
+    aos seus vizinhos mais centrais (influência de amigos com maior centralidade)?
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo com atributo 'genres' nos nós.
+    percentile_low : int
+        Percentil para definir nós "menos centrais" (ex: 25).
+    similarity_metric : str
+        'jaccard' — similaridade de Jaccard entre conjuntos de gêneros.
+        'cosine' — similaridade de cosseno (baseada em frequência).
+    return_details : bool
+        Se True, retorna dict completo; se False, retorna um float [0, 1].
+
+    Returns
+    -------
+    dict ou float
+        Se False, retorna float: média de similaridade entre nós periféricos e
+        seus vizinhos mais centrais.
+        Se True, retorna dicionário com 'avg_similarity', 'std_similarity',
+        'n_peripheral_nodes', 'n_edges_periph_to_central', 'similarities'.
     """
-    grupos = df.groupby(["Mocodes", "Crm Cd Desc", df["DATE OCC"].dt.date])  # Agrupa por dia e tipo de crime
-    conexoes_total = defaultdict(int)
+    import numpy as np
 
-    # Cria conexões entre áreas no mesmo grupo
-    for _, grupo in grupos:
-        areas = grupo["AREA NAME"]
-        for a1, a2 in combinations(sorted(areas), 2):
-            conexoes_total[(a1, a2)] += 1
+    # calcula grau (medida simples de centralidade)
+    degrees = np.array(g.degree())
+    low_threshold = np.percentile(degrees, percentile_low)
 
-    return construir_grafo(conexoes_total)
+    idx_peripheral = np.where(degrees <= low_threshold)[0]
+    idx_central_set = set(np.where(degrees > low_threshold)[0])
 
-# ============================== Aplicar Leiden ==============================
-def aplicar_leiden_e_analisar(grafo_nx, contagem_por_area):
-    """
-    Converte o grafo NetworkX para iGraph e aplica o algoritmo Leiden de detecção de comunidades.
+    # função de similaridade
+    def jaccard_similarity(set_a, set_b):
+        if not set_a or not set_b:
+            return 0.0
+        intersection = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return intersection / union if union > 0 else 0.0
 
-    Parâmetros:
-        grafo_nx (Graph): Grafo original NetworkX.
-        contagem_por_area (dict): Número de ocorrências por área.
+    def cosine_similarity(list_a, list_b):
+        from collections import Counter
+        if not list_a or not list_b:
+            return 0.0
+        cnt_a = Counter(list_a)
+        cnt_b = Counter(list_b)
+        all_genres = set(cnt_a.keys()) | set(cnt_b.keys())
+        dot_product = sum(cnt_a.get(g, 0) * cnt_b.get(g, 0) for g in all_genres)
+        norm_a = sum(cnt_a[g] ** 2 for g in all_genres) ** 0.5
+        norm_b = sum(cnt_b[g] ** 2 for g in all_genres) ** 0.5
+        denom = norm_a * norm_b
+        return dot_product / denom if denom > 0 else 0.0
 
-    Retorno:
-        particao: Objeto de partição retornado pelo Leiden.
-        dados_comunidades (dict): Dados analíticos por comunidade detectada.
-    """
-    # Converte grafo NetworkX para iGraph
-    grafo_ig = ig.Graph()
-    grafo_ig.add_vertices(list(grafo_nx.nodes))
-    grafo_ig.add_edges(list(grafo_nx.edges))
+    similarities = []
+    edges_periph_to_central = 0
 
-    # Define os pesos das arestas
-    pesos = [grafo_nx[u][v].get('weight', 1.0) for u, v in grafo_nx.edges]
-    grafo_ig.es['weight'] = pesos
+    for v_periph in idx_peripheral:
+        genres_v = set(g.vs[v_periph]['genres'] or [])
+        if not genres_v:
+            continue
 
-    # Aplica o algoritmo Leiden
-    particao = leidenalg.find_partition(
-        grafo_ig,
-        leidenalg.RBConfigurationVertexPartition, # Parâmetro que controla o método de separação das comunidades e extração da modularidade
-        resolution_parameter=1,  # Quanto maior, mais comunidades
-        weights='weight',
-        seed=42 # Deixa a partição determinística, ideal para análise
-    )
+        # encontra vizinhos que são mais centrais
+        neighbors = set(g.neighbors(v_periph))
+        neighbors_central = neighbors & idx_central_set
 
-    # Mapeamento de área para comunidade
-    comunidades = {grafo_ig.vs[i]['name']: cid for i, cid in enumerate(particao.membership)}
+        if not neighbors_central:
+            continue
 
-    # Inicialização dos dicionários para análise
-    pesos_comunidade = {}
-    registros_comunidade = {}
-    dados_comunidades = {}
+        edges_periph_to_central += len(neighbors_central)
 
-    # Conta o número de registros por comunidade
-    for area, cid in comunidades.items():
-        registros_comunidade[cid] = registros_comunidade.get(cid, 0) + contagem_por_area.get(area, 0)
+        # calcula similaridade com cada vizinho central
+        for v_central in neighbors_central:
+            genres_central = g.vs[v_central]['genres'] or []
 
-    # Calcula o peso interno das comunidades (soma dos pesos das arestas internas)
-    for eid in range(len(grafo_ig.es)):
-        v1 = grafo_ig.vs[grafo_ig.es[eid].source]['name']
-        v2 = grafo_ig.vs[grafo_ig.es[eid].target]['name']
-        w = grafo_ig.es[eid]['weight']
-        c1 = comunidades[v1]
-        c2 = comunidades[v2]
-        if c1 == c2:
-            pesos_comunidade[c1] = pesos_comunidade.get(c1, 0) + w
+            if similarity_metric == 'jaccard':
+                sim = jaccard_similarity(genres_v, set(genres_central))
+            elif similarity_metric == 'cosine':
+                sim = cosine_similarity(list(genres_v), genres_central)
+            else:
+                raise ValueError(f"Métrica '{similarity_metric}' não suportada.")
 
-    # Prepara os dados finais por comunidade
-    for cid in pesos_comunidade:
-        peso_total = pesos_comunidade[cid]
-        total_registros = registros_comunidade.get(cid, 1)
-        proporcao = peso_total / total_registros if total_registros > 0 else 0
+            similarities.append(sim)
 
-        # Detalhes por área dentro da comunidade
-        areas_comunidade = sorted(set(area for area, com_id in comunidades.items() if com_id == cid))
-        dados_area = {}
+    if not similarities:
+        avg_sim = 0.0
+        std_sim = 0.0
+    else:
+        avg_sim = float(np.mean(similarities))
+        std_sim = float(np.std(similarities))
 
-        for area in sorted(areas_comunidade):
-            grau_ponderado = grafo_nx.degree(area, weight='weight') if grafo_nx.has_node(area) else 0
-            registros_area = contagem_por_area.get(area, 0)
-            dados_area[area] = {"registros_area": registros_area,
-                                "grau_ponderado": grau_ponderado}
-        
-        dados_comunidades[cid] = {'peso_total': peso_total,
-                                  "total_registros": total_registros,
-                                  "proporcao": proporcao,
-                                  "dados_area": dados_area}
+    details = {
+        'avg_similarity': avg_sim,
+        'std_similarity': std_sim,
+        'n_peripheral_nodes': int(len(idx_peripheral)),
+        'n_edges_periph_to_central': int(edges_periph_to_central),
+        'similarity_metric': similarity_metric,
+        'percentile_threshold': percentile_low,
+        'similarities': similarities
+    }
 
-    return particao, dados_comunidades
-
-def layout_por_comunidade(grafo, particao, escala_comunidade=5, escala_local=1):
-    """
-    Gera um layout para o grafo onde as comunidades ficam agrupadas visualmente.
-
-    Parâmetros:
-        grafo (Graph): Grafo NetworkX.
-        particao: Resultado do Leiden (partição das comunidades).
-        escala_comunidade (float): Controle de espaçamento entre comunidades.
-        escala_local (float): Controle de espaçamento dentro de cada comunidade.
-
-    Retorno:
-        pos_final (dict): Posições finais dos nós para plotagem.
-    """
-    comunidades = {}
-    for node, cid in zip(grafo.nodes, particao.membership):
-        comunidades.setdefault(cid, []).append(node)
-
-    # Cria o meta-grafo (um nó por comunidade)
-    meta_grafo = nx.Graph()
-    for cid in comunidades:
-        meta_grafo.add_node(cid)
-    for u, v in grafo.edges:
-        cu = particao.membership[list(grafo.nodes).index(u)]
-        cv = particao.membership[list(grafo.nodes).index(v)]
-        if cu != cv:
-            meta_grafo.add_edge(cu, cv)
-
-    # Calcula layout entre comunidades
-    pos_comunidades = nx.spring_layout(meta_grafo, scale=escala_comunidade, seed=42)
-
-    # Calcula layout dentro de cada comunidade
-    pos_final = {}
-    for cid, nodes in comunidades.items():
-        subgrafo = grafo.subgraph(nodes)
-        centro = pos_comunidades[cid]
-        pos_local = nx.spring_layout(subgrafo, scale=escala_local, seed=42)
-        for n in subgrafo.nodes:
-            offset = np.array(pos_local[n])
-            pos_final[n] = centro + offset
-
-    return pos_final
+    return details if return_details else avg_sim
