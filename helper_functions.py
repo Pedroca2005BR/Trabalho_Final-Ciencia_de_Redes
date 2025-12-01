@@ -509,3 +509,99 @@ def check_neighbor_similarity(g: ig.Graph, percentile_low: int = 25,
     }
 
     return details if return_details else avg_sim
+
+
+def plot_degree_distribution(g: ig.Graph, title: str = "Distribuição de Graus",
+                             figsize: tuple = (12, 5), show_fit: bool = True,
+                             output_path: str | None = None):
+    """Plota a distribuição de graus em escala log-log para visualizar lei de potência.
+
+    A visualização em log-log ajuda a identificar visualmente se o grafo segue
+    uma distribuição de lei de potência (power-law). Uma reta em log-log indica
+    conformidade com lei de potência.
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo a ser analisado.
+    title : str
+        Título do gráfico.
+    figsize : tuple
+        Tamanho da figura (width, height).
+    show_fit : bool
+        Se True, ajusta e plota uma reta em log-log (regressão linear).
+    output_path : str | None
+        Se fornecido, salva a figura neste caminho.
+
+    Returns
+    -------
+    None
+        Exibe o gráfico usando matplotlib.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from collections import Counter
+
+    degs = np.array(g.degree())
+    deg_count = Counter(degs)
+
+    # ordena por grau
+    ks = np.array(sorted(deg_count.keys()))
+    freqs = np.array([deg_count[k] for k in ks], dtype=float)
+    # probabilidade P(k)
+    pk = freqs / freqs.sum()
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # --- Plot 1: Escala Linear ---
+    ax_lin = axes[0]
+    ax_lin.bar(ks, pk, color='steelblue', alpha=0.7, edgecolor='black', linewidth=0.5)
+    ax_lin.set_xlabel('Grau (k)', fontsize=11)
+    ax_lin.set_ylabel('P(k)', fontsize=11)
+    ax_lin.set_title('Escala Linear', fontsize=12, fontweight='bold')
+    ax_lin.grid(True, alpha=0.3, linestyle='--')
+
+    # --- Plot 2: Escala Log-Log ---
+    ax_log = axes[1]
+
+    # remove zeros para log
+    mask = pk > 0
+    ks_nonzero = ks[mask]
+    pk_nonzero = pk[mask]
+
+    ax_log.scatter(ks_nonzero, pk_nonzero, s=50, alpha=0.6, color='darkblue', 
+                   edgecolor='black', linewidth=0.5, label='Dados observados')
+
+    # ajusta reta em log-log se solicitado
+    if show_fit and len(ks_nonzero) > 2:
+        logk = np.log(ks_nonzero)
+        logpk = np.log(pk_nonzero)
+        slope, intercept = np.polyfit(logk, logpk, 1)
+        
+        # calcula R²
+        pred = slope * logk + intercept
+        ss_res = np.sum((logpk - pred) ** 2)
+        ss_tot = np.sum((logpk - logpk.mean()) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        # plota reta ajustada
+        k_fit = np.linspace(ks_nonzero.min(), ks_nonzero.max(), 100)
+        pk_fit = np.exp(slope * np.log(k_fit) + intercept)
+        ax_log.plot(k_fit, pk_fit, 'r-', linewidth=2.5, label=f'Ajuste: γ={-slope:.2f}, R²={r2:.3f}')
+
+    ax_log.set_xscale('log')
+    ax_log.set_yscale('log')
+    ax_log.set_xlabel('Grau (k)', fontsize=11)
+    ax_log.set_ylabel('P(k)', fontsize=11)
+    ax_log.set_title('Escala Log-Log (Power-Law Check)', fontsize=12, fontweight='bold')
+    ax_log.grid(True, alpha=0.3, linestyle='--', which='both')
+    ax_log.legend(loc='best', fontsize=10)
+
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Gráfico salvo em: {output_path}")
+
+    plt.show()
