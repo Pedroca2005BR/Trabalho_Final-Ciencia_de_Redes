@@ -605,3 +605,477 @@ def plot_degree_distribution(g: ig.Graph, title: str = "Distribuição de Graus"
         print(f"Gráfico salvo em: {output_path}")
 
     plt.show()
+
+
+def evaluate_community_quality(g: ig.Graph, partitions, return_details: bool = True) -> dict | float:
+    """Avalia a qualidade e conectividade das comunidades detectadas.
+
+    Calcula múltiplas métricas de qualidade: modularidade, densidade interna,
+    condutância (isolamento), tamanho dos clusters, etc.
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo onde as comunidades foram detectadas.
+    partitions : VertexClustering, lista ou dict
+        Partição de comunidades. Pode ser:
+        - Objeto VertexClustering (leidenalg, igraph)
+        - Lista de rótulos de comunidade [0, 1, 1, 2, ...]
+        - Dict {node_id: community_id}
+    return_details : bool
+        Se True, retorna dict completo; se False, retorna apenas a modularidade.
+
+    Returns
+    -------
+    dict ou float
+        Se `return_details` for False, retorna float (modularidade).
+        Se True, retorna dict com métricas detalhadas:
+        - 'modularity': modularidade global
+        - 'n_communities': número de comunidades
+        - 'n_nodes': número total de nós
+        - 'internal_density': densidade média dentro de comunidades
+        - 'conductance': condutância média (fluxo para fora)
+        - 'community_sizes': distribuição de tamanhos
+        - 'quality_score': score [0, 1] combinando métricas
+    """
+    import numpy as np
+
+    # extrai membership
+    if hasattr(partitions, 'membership'):
+        membership = list(partitions.membership)
+    elif isinstance(partitions, (list, tuple)):
+        membership = list(partitions)
+    elif isinstance(partitions, dict):
+        membership = [partitions.get(v, 0) for v in range(g.vcount())]
+    else:
+        raise TypeError("'partitions' deve ser VertexClustering, lista ou dict")
+
+    # valida membership
+    if len(membership) != g.vcount():
+        raise ValueError(f"Tamanho do membership ({len(membership)}) != nós do grafo ({g.vcount()})")
+
+    # constrói grupos de nós por comunidade
+    comms = {}
+    for v_idx, c in enumerate(membership):
+        comms.setdefault(c, []).append(v_idx)
+
+    n_comms = len(comms)
+    n_nodes = g.vcount()
+
+    # --- 1. Modularidade ---
+    modularity = g.modularity(membership)
+
+    # --- 2. Densidade Interna ---
+    densities = []
+    for nodes in comms.values():
+        n = len(nodes)
+        if n <= 1:
+            densities.append(0.0)
+            continue
+        subg = g.subgraph(nodes)
+        m_internal = subg.ecount()
+        possible_edges = n * (n - 1) / 2
+        densities.append(m_internal / possible_edges if possible_edges > 0 else 0.0)
+
+    avg_internal_density = float(np.mean(densities)) if densities else 0.0
+
+    # --- 3. Condutância (fluxo de fora da comunidade) ---
+    conductances = []
+    total_degree = np.array(g.degree())
+
+    for nodes in comms.values():
+        node_set = set(nodes)
+        # arestas que cruzam a fronteira
+        cut_edges = 0
+        for v in nodes:
+            for neighbor in g.neighbors(v):
+                if neighbor not in node_set:
+                    cut_edges += 1
+
+        # volume (soma de graus)
+        vol = sum(total_degree[v] for v in nodes)
+
+        if vol > 0:
+            conductance = cut_edges / vol
+        else:
+            conductance = 0.0
+
+        conductances.append(conductance)
+
+    avg_conductance = float(np.mean(conductances)) if conductances else 0.0
+
+    # --- 4. Distribuição de tamanhos ---
+    sizes = np.array([len(nodes) for nodes in comms.values()])
+    size_stats = {
+        'min': int(sizes.min()),
+        'max': int(sizes.max()),
+        'mean': float(sizes.mean()),
+        'median': float(np.median(sizes)),
+        'std': float(sizes.std())
+    }
+
+    # --- 5. Score de qualidade combinado [0, 1] ---
+    # quanto maior a modularidade, melhor
+    # quanto menor a condutância, melhor (comunidades bem isoladas)
+    # quanto maior a densidade interna, melhor
+    q_modularity = max(0.0, modularity)  # normaliza para [0, ...]
+    q_density = avg_internal_density  # já em [0, 1]
+    q_isolation = 1.0 - avg_conductance  # quanto menor cond, maior score
+
+    # combina com pesos
+    quality_score = (0.5 * q_modularity + 0.3 * q_density + 0.2 * q_isolation)
+
+    details = {
+        'modularity': float(modularity),
+        'n_communities': int(n_comms),
+        'n_nodes': int(n_nodes),
+        'internal_density_avg': avg_internal_density,
+        'internal_density_per_community': [float(d) for d in densities],
+        'conductance_avg': avg_conductance,
+        'conductance_per_community': [float(c) for c in conductances],
+        'community_sizes': size_stats,
+        'quality_score': float(quality_score)
+    }
+
+    return details if return_details else float(modularity)
+
+
+def detect_and_plot_with_quality(g: ig.Graph, resolution: float = 1.0,
+                                 plot: bool = True, return_quality: bool = True):
+    """Detecta comunidades com Leiden e retorna tanto a partição quanto sua qualidade.
+
+    Wrapper que chama `detect_and_plot` e em seguida `evaluate_community_quality`.
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo para detectar comunidades.
+    resolution : float
+        Parâmetro de resolução do algoritmo Leiden.
+    plot : bool
+        Se True, plota o resultado usando `detect_and_plot`.
+    return_quality : bool
+        Se True, retorna (partitions, quality_dict); se False, retorna apenas partitions.
+
+    Returns
+    -------
+    tuple ou VertexClustering
+        Se `return_quality` for True: (partitions, quality_dict)
+        Se False: partitions
+    """
+    from detect_and_plot_leiden import detect_and_plot
+
+    # detecta comunidades
+    result = detect_and_plot(g, resolution=resolution, plot=plot)
+
+    if plot:
+        # detect_and_plot retorna (partition, coords) quando plot=True
+        partitions = result[0] if isinstance(result, tuple) else result
+    else:
+        partitions = result
+
+    if return_quality:
+        quality = evaluate_community_quality(g, partitions, return_details=True)
+        return partitions, quality
+    else:
+        return partitions
+
+
+def analyze_inter_community_communication(g: ig.Graph, partitions,
+                                          return_details: bool = True) -> dict:
+    """Analisa a comunicação (arestas) entre comunidades.
+
+    Computa quantas arestas conectam cada par de comunidades,
+    e calcula métricas de volume de tráfego inter-comunitário.
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo com as comunidades.
+    partitions : VertexClustering, lista ou dict
+        Partição de comunidades.
+    return_details : bool
+        Se True, retorna dict completo; se False, retorna apenas matriz de comunicação.
+
+    Returns
+    -------
+    dict ou array
+        Se False, retorna matriz de arestas inter-comunitárias.
+        Se True, retorna dict com:
+        - 'inter_community_edges': matriz de comunicação
+        - 'total_inter_edges': total de arestas entre comunidades
+        - 'total_intra_edges': total de arestas dentro de comunidades
+        - 'edge_ratio': proporção inter/total
+        - 'communication_strength': força normalizada de cada par
+        - 'community_connectivity': quantas outras comunidades cada uma toca
+    """
+    import numpy as np
+
+    # extrai membership
+    if hasattr(partitions, 'membership'):
+        membership = list(partitions.membership)
+    elif isinstance(partitions, (list, tuple)):
+        membership = list(partitions)
+    elif isinstance(partitions, dict):
+        membership = [partitions.get(v, 0) for v in range(g.vcount())]
+    else:
+        raise TypeError("'partitions' deve ser VertexClustering, lista ou dict")
+
+    n_comms = max(membership) + 1
+    # matriz de arestas entre comunidades
+    inter_edges = np.zeros((n_comms, n_comms), dtype=int)
+    intra_edges = 0
+
+    for edge in g.es:
+        u, v = edge.tuple
+        comm_u = membership[u]
+        comm_v = membership[v]
+
+        if comm_u == comm_v:
+            intra_edges += 1
+        else:
+            # garante simetria
+            if comm_u < comm_v:
+                inter_edges[comm_u, comm_v] += 1
+            else:
+                inter_edges[comm_v, comm_u] += 1
+
+    # torna simétrica
+    inter_edges = inter_edges + inter_edges.T
+
+    total_inter = np.sum(inter_edges) // 2  # divide por 2 pois contamos duas vezes
+    total_edges = g.ecount()
+    edge_ratio = total_inter / total_edges if total_edges > 0 else 0.0
+
+    # força normalizada (max = 1)
+    max_inter = inter_edges.max() if inter_edges.max() > 0 else 1
+    communication_strength = inter_edges / max_inter
+
+    # conectividade: quantas comunidades cada uma se conecta
+    connectivity = np.zeros(n_comms, dtype=int)
+    for i in range(n_comms):
+        connectivity[i] = np.count_nonzero(inter_edges[i])
+
+    details = {
+        'inter_community_edges': inter_edges,
+        'total_inter_edges': int(total_inter),
+        'total_intra_edges': int(intra_edges),
+        'edge_ratio': float(edge_ratio),
+        'communication_strength': communication_strength,
+        'community_connectivity': connectivity.tolist(),
+        'n_communities': int(n_comms)
+    }
+
+    return details if return_details else inter_edges
+
+
+def analyze_genre_influence_on_communication(g: ig.Graph, partitions,
+                                              return_details: bool = True) -> dict:
+    """Analisa se a similaridade de gêneros musicais influencia a comunicação entre comunidades.
+
+    Computa:
+    1. Similaridade de gêneros entre pares de comunidades
+    2. Volume de arestas entre os mesmos pares
+    3. Correlação entre similaridade de gêneros e comunicação
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo com atributo 'genres' nos nós.
+    partitions : VertexClustering, lista ou dict
+        Partição de comunidades.
+    return_details : bool
+        Se True, retorna dict completo.
+
+    Returns
+    -------
+    dict
+        - 'genre_similarity': matriz de similaridade de gêneros
+        - 'edge_volume': matriz de volume de arestas
+        - 'correlation': correlação entre gêneros e comunicação
+        - 'genre_diversity_per_community': diversidade de gêneros por comunidade
+        - 'analysis': parecer qualitativo
+    """
+    import numpy as np
+    from collections import Counter
+
+    # extrai membership
+    if hasattr(partitions, 'membership'):
+        membership = list(partitions.membership)
+    elif isinstance(partitions, (list, tuple)):
+        membership = list(partitions)
+    elif isinstance(partitions, dict):
+        membership = [partitions.get(v, 0) for v in range(g.vcount())]
+    else:
+        raise TypeError("'partitions' deve ser VertexClustering, lista ou dict")
+
+    n_comms = max(membership) + 1
+
+    # agrupa gêneros por comunidade
+    comms = {}
+    for v_idx, c in enumerate(membership):
+        comms.setdefault(c, []).append(v_idx)
+
+    comm_genres = {}
+    for c, nodes in comms.items():
+        all_genres = []
+        for v in nodes:
+            genres = g.vs[v]['genres']
+            if genres:
+                all_genres.extend(genres)
+        comm_genres[c] = Counter(all_genres)
+
+    # matriz de similaridade Jaccard de gêneros
+    genre_similarity = np.zeros((n_comms, n_comms), dtype=float)
+
+    for i in range(n_comms):
+        for j in range(i + 1, n_comms):
+            genres_i = set(comm_genres[i].keys())
+            genres_j = set(comm_genres[j].keys())
+
+            if not genres_i and not genres_j:
+                sim = 1.0
+            elif not genres_i or not genres_j:
+                sim = 0.0
+            else:
+                intersection = len(genres_i & genres_j)
+                union = len(genres_i | genres_j)
+                sim = intersection / union if union > 0 else 0.0
+
+            genre_similarity[i, j] = sim
+            genre_similarity[j, i] = sim
+
+    # obter volume de arestas inter-comunitárias
+    inter_comm = analyze_inter_community_communication(g, membership, return_details=False)
+
+    # correlação entre similaridade de gêneros e volume de arestas
+    # remove diagonal e triângulo inferior
+    genre_vec = []
+    edge_vec = []
+
+    for i in range(n_comms):
+        for j in range(i + 1, n_comms):
+            genre_vec.append(genre_similarity[i, j])
+            edge_vec.append(inter_comm[i, j])
+
+    if len(genre_vec) > 1:
+        correlation = float(np.corrcoef(genre_vec, edge_vec)[0, 1])
+    else:
+        correlation = 0.0
+
+    # diversidade de gêneros por comunidade (usando Shannon entropy)
+    genre_diversity = []
+    for c in range(n_comms):
+        if not comm_genres[c]:
+            genre_diversity.append(0.0)
+            continue
+        total = sum(comm_genres[c].values())
+        h = 0.0
+        for count in comm_genres[c].values():
+            p = count / total
+            if p > 0:
+                h -= p * np.log(p)
+        genre_diversity.append(h)
+
+    # parecer qualitativo
+    if np.isnan(correlation):
+        analysis = "Correlação indefinida (poucos pares de comunidades)"
+    elif abs(correlation) < 0.3:
+        analysis = "Influência fraca: gêneros musicais não explicam bem a comunicação"
+    elif correlation > 0.5:
+        analysis = "Influência forte positiva: comunidades com gêneros similares se comunicam mais"
+    elif correlation < -0.5:
+        analysis = "Influência forte negativa: comunidades com gêneros diferentes se comunicam mais"
+    else:
+        analysis = "Influência moderada entre gêneros musicais e comunicação"
+
+    details = {
+        'genre_similarity': genre_similarity,
+        'edge_volume': inter_comm,
+        'correlation': float(correlation) if not np.isnan(correlation) else None,
+        'genre_diversity_per_community': genre_diversity,
+        'analysis': analysis,
+        'n_communities': int(n_comms),
+        'genre_correlation_pairs': list(zip(genre_vec, edge_vec))
+    }
+
+    return details
+
+
+def plot_inter_community_communication(g: ig.Graph, partitions,
+                                       figsize: tuple = (14, 5),
+                                       output_path: str | None = None):
+    """Plota a comunicação entre comunidades de forma visual.
+
+    Cria dois plots:
+    1. Matriz de calor (heatmap) do volume de arestas
+    2. Gráfico de dispersão: similaridade de gêneros vs volume de arestas
+
+    Parameters
+    ----------
+    g : ig.Graph
+        Grafo.
+    partitions : VertexClustering, lista ou dict
+        Partição de comunidades.
+    figsize : tuple
+        Tamanho da figura.
+    output_path : str | None
+        Caminho para salvar a figura.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # analisa comunicação
+    comm_analysis = analyze_inter_community_communication(g, partitions, return_details=True)
+    inter_edges = comm_analysis['inter_community_edges']
+
+    # analisa influência de gêneros
+    genre_analysis = analyze_genre_influence_on_communication(g, partitions, return_details=True)
+    genre_sim = genre_analysis['genre_similarity']
+    correlation = genre_analysis['correlation']
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # --- Plot 1: Heatmap de comunicação ---
+    ax1 = axes[0]
+    im1 = ax1.imshow(inter_edges, cmap='YlOrRd', aspect='auto')
+    ax1.set_xlabel('Comunidade', fontsize=11)
+    ax1.set_ylabel('Comunidade', fontsize=11)
+    ax1.set_title('Arestas inter-comunitárias', fontsize=12, fontweight='bold')
+    plt.colorbar(im1, ax=ax1, label='# Arestas')
+
+    # adiciona valores nas células
+    for i in range(inter_edges.shape[0]):
+        for j in range(inter_edges.shape[1]):
+            ax1.text(j, i, f'{int(inter_edges[i, j])}',
+                    ha='center', va='center', color='black', fontsize=9)
+
+    # --- Plot 2: Dispersão: Gêneros vs Comunicação ---
+    ax2 = axes[1]
+
+    # extrai pares únicos
+    pairs_sim = []
+    pairs_edges = []
+    for i in range(genre_sim.shape[0]):
+        for j in range(i + 1, genre_sim.shape[1]):
+            pairs_sim.append(genre_sim[i, j])
+            pairs_edges.append(inter_edges[i, j])
+
+    if pairs_sim:
+        ax2.scatter(pairs_sim, pairs_edges, s=100, alpha=0.6, color='steelblue',
+                   edgecolor='black', linewidth=0.8)
+        ax2.set_xlabel('Similaridade de Gêneros (Jaccard)', fontsize=11)
+        ax2.set_ylabel('Volume de Arestas', fontsize=11)
+        ax2.set_title(f'Gêneros vs Comunicação (r={correlation:.3f})', 
+                     fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3, linestyle='--')
+
+    fig.suptitle(f"Comunicação Inter-Comunitária - {genre_analysis['analysis']}", 
+                 fontsize=13, fontweight='bold', y=1.00)
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Gráfico salvo em: {output_path}")
+
+    plt.show()
